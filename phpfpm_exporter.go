@@ -27,12 +27,12 @@ import (
 
 	"path/filepath"
 
+	fcgiclient "github.com/kanocz/fcgi_client"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	client_model "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/version"
-	fcgiclient "github.com/tomasen/fcgi_client"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
@@ -146,18 +146,22 @@ func CollectStatusFromReader(reader io.Reader, socketPath string, ch chan<- prom
 	return nil
 }
 
-func CollectStatusFromSocket(path string, statusPath string, timeout time.Duration, ch chan<- prometheus.Metric) error {
+func CollectStatusFromSocket(path string, statusPath string, connectTimeout time.Duration, operationTimeout time.Duration, ch chan<- prometheus.Metric) error {
 
 	env := make(map[string]string)
 	env["SCRIPT_FILENAME"] = statusPath
 	env["SCRIPT_NAME"] = statusPath
 	env["REQUEST_METHOD"] = "GET"
 
-	fcgi, err := fcgiclient.DialTimeout("unix", path, timeout)
+	fcgi, err := fcgiclient.DialTimeout("unix", path, connectTimeout)
 	if err != nil {
 		return err
 	}
 	defer fcgi.Close()
+
+	if operationTimeout > 0 {
+		fcgi.SetTimeout(operationTimeout)
+	}
 
 	resp, err := fcgi.Get(env)
 	if err != nil {
@@ -167,17 +171,21 @@ func CollectStatusFromSocket(path string, statusPath string, timeout time.Durati
 	return CollectStatusFromReader(resp.Body, path, ch)
 }
 
-func CollectMetricsFromScript(socketPaths []string, socketTimeout time.Duration, scriptPaths []string) ([]*client_model.MetricFamily, error) {
+func CollectMetricsFromScript(socketPaths []string, connectTimeout time.Duration, operationTimeout time.Duration, scriptPaths []string) ([]*client_model.MetricFamily, error) {
 	var result []*client_model.MetricFamily
 
 	for _, socketPath := range socketPaths {
 
 		for _, scriptPath := range scriptPaths {
-			fcgi, err := fcgiclient.DialTimeout("unix", socketPath, socketTimeout)
+			fcgi, err := fcgiclient.DialTimeout("unix", socketPath, connectTimeout)
 			if err != nil {
 				return result, err
 			}
 			defer fcgi.Close()
+
+			if operationTimeout > 0 {
+				fcgi.SetTimeout(operationTimeout)
+			}
 
 			env := make(map[string]string)
 			env["DOCUMENT_ROOT"] = path.Dir(scriptPath)
@@ -219,16 +227,18 @@ func CollectMetricsFromScript(socketPaths []string, socketTimeout time.Duration,
 }
 
 type PhpfpmExporter struct {
-	socketPaths   []string
-	socketTimeout time.Duration
-	statusPath    string
+	socketPaths      []string
+	connectTimeout   time.Duration
+	operationTimeout time.Duration
+	statusPath       string
 }
 
-func NewPhpfpmExporter(socketPaths []string, socketTimeout time.Duration, statusPath string) (*PhpfpmExporter, error) {
+func NewPhpfpmExporter(socketPaths []string, connectTimeout time.Duration, operationTimeout time.Duration, statusPath string) (*PhpfpmExporter, error) {
 	return &PhpfpmExporter{
-		socketPaths:   socketPaths,
-		socketTimeout: socketTimeout,
-		statusPath:    statusPath,
+		socketPaths:      socketPaths,
+		connectTimeout:   connectTimeout,
+		operationTimeout: operationTimeout,
+		statusPath:       statusPath,
 	}, nil
 }
 
@@ -244,7 +254,7 @@ func (e *PhpfpmExporter) Describe(ch chan<- *prometheus.Desc) {
 func (e *PhpfpmExporter) Collect(ch chan<- prometheus.Metric) {
 
 	for _, socketPath := range e.socketPaths {
-		err := CollectStatusFromSocket(socketPath, e.statusPath, e.socketTimeout, ch)
+		err := CollectStatusFromSocket(socketPath, e.statusPath, e.connectTimeout, e.operationTimeout, ch)
 		if err == nil {
 			ch <- prometheus.MustNewConstMetric(
 				phpfpmUpDesc,
@@ -264,14 +274,15 @@ func (e *PhpfpmExporter) Collect(ch chan<- prometheus.Metric) {
 
 func main() {
 	var (
-		listenAddress        = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9253").String()
-		metricsPath          = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
-		socketPaths          = kingpin.Flag("phpfpm.socket-paths", "Paths of the PHP-FPM sockets.").Strings()
-		socketDirectories    = kingpin.Flag("phpfpm.socket-directories", "Path(s) of the directory where PHP-FPM sockets are located.").Strings()
-		statusPath           = kingpin.Flag("phpfpm.status-path", "Path which has been configured in PHP-FPM to show status page.").Default("/status").String()
-		scriptCollectorPaths = kingpin.Flag("phpfpm.script-collector-paths", "Paths of the PHP file whose output needs to be collected.").Strings()
-		socketTimeout        = kingpin.Flag("phpfpm.socket-timeout", "Connection timeout for PHP-FPM sockets.").Duration()
-		showVersion          = kingpin.Flag("version", "Print version information.").Bool()
+		listenAddress           = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9253").String()
+		metricsPath             = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
+		socketPaths             = kingpin.Flag("phpfpm.socket-paths", "Paths of the PHP-FPM sockets.").Strings()
+		socketDirectories       = kingpin.Flag("phpfpm.socket-directories", "Path(s) of the directory where PHP-FPM sockets are located.").Strings()
+		statusPath              = kingpin.Flag("phpfpm.status-path", "Path which has been configured in PHP-FPM to show status page.").Default("/status").String()
+		scriptCollectorPaths    = kingpin.Flag("phpfpm.script-collector-paths", "Paths of the PHP file whose output needs to be collected.").Strings()
+		socketConnectionTimeout = kingpin.Flag("phpfpm.connection-timeout", "Connection timeout for PHP-FPM sockets.").Duration()
+		socketOperationTimeout  = kingpin.Flag("phpfpm.operation-timeout", "Read/write operation timeout for PHP-FPM sockets.").Duration()
+		showVersion             = kingpin.Flag("version", "Print version information.").Bool()
 	)
 
 	kingpin.CommandLine.HelpFlag.Short('h')
@@ -296,7 +307,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	exporter, err := NewPhpfpmExporter(sockets, *socketTimeout, *statusPath)
+	exporter, err := NewPhpfpmExporter(sockets, *socketConnectionTimeout, *socketOperationTimeout, *statusPath)
 	if err != nil {
 		panic(err)
 	}
@@ -307,7 +318,7 @@ func main() {
 		gatherer = prometheus.Gatherers{
 			prometheus.DefaultGatherer,
 			prometheus.GathererFunc(func() ([]*client_model.MetricFamily, error) {
-				return CollectMetricsFromScript(sockets, *socketTimeout, *scriptCollectorPaths)
+				return CollectMetricsFromScript(sockets, *socketConnectionTimeout, *socketOperationTimeout, *scriptCollectorPaths)
 			}),
 		}
 	}
